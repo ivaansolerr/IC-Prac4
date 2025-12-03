@@ -54,10 +54,12 @@ int main(int argc, char *argv[]) {
 
     MPI_Reduce(&local_repetitions, &repetitions, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
 
-    if (rank == 0) {
-        printf("The number %d was repeated %d times in the array.\n", num, repetitions);
-    }
+    // if (rank == 0) {
+    //     printf("The number %d was repeated %d times in the array.\n", num, repetitions);
+    // }
     
+    printf("The number %d was repeated %d times in the array.\n", num, repetitions);
+
     free(local_array);
     MPI_Finalize();
     
