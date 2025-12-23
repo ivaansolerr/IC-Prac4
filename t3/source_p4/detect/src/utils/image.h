@@ -1,5 +1,6 @@
 #ifndef __IMAGE__H__
 #define __IMAGE__H__
+#include "mpi.h"
 #include <vector>
 #include <memory>
 #include <iostream>
@@ -7,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <cassert>
+#include <limits>
 
 template <typename T>
 class Block;
@@ -36,7 +38,11 @@ public:
     Image<float> normalized() const;
     Image<T> convolution(const Image<float> &kernel) const;
     std::vector<Block<T>> get_blocks(int block_size = 8);
-};
+    T* get_matrix() { return matrix.get(); }
+    const T* get_matrix() const { return matrix.get(); }
+    T* data() { return matrix.get(); }
+    const T* data() const { return matrix.get(); }
+    };
 
 Image<unsigned char> load_from_file(const std::string &filename);
 void save_to_file(const std::string &filename, const Image<unsigned char> &image, int quality = 100);
@@ -260,16 +266,8 @@ template <class T> Image<T> Image<T>::operator*(const Image<T> &other) const
 
 
 
-    int val = 0;
-
-    if (rank == 0){
-        val = new_image.get_matrix();
-    }
-    else{
-        val = NULL;
-    }
-    
-    MPI_Gatherv(local_result.get_matrix(), local_rows * elements_per_row, mpi_type, val, recvcounts.data(), displs.data(), mpi_type, 0, MPI_COMM_WORLD);
+    T* result_ptr = (rank == 0) ? new_image.get_matrix() : nullptr;
+    MPI_Gatherv(local_result.get_matrix(), local_rows * elements_per_row, mpi_type, result_ptr, recvcounts.data(), displs.data(), mpi_type, 0, MPI_COMM_WORLD);
 
     return new_image;
 }
@@ -381,16 +379,10 @@ template <class T> Image<T> Image<T>::operator*(float scalar) const
 
         
 
-    val = 0;
-
-    if(rank == 0){
-        val = new_image.get_matrix();
-    }
-    else{
-        val = NULL;
-    }
+    T* result_ptr = (rank == 0) ? new_image.get_matrix() : nullptr;
     
-    MPI_Gatherv(local_result.get_matrix(), local_rows * elements_per_row, mpi_type, val, recvcounts.data(), displs.data(), mpi_type, 0, MPI_COMM_WORLD);
+    MPI_Gatherv(local_result.get_matrix(), local_rows * elements_per_row, mpi_type, result_ptr, recvcounts.data(), displs.data(), mpi_type, 0, MPI_COMM_WORLD);
+    
 
     return new_image;
 }
@@ -1029,4 +1021,108 @@ std::vector<Block<T>> Image<T>::get_blocks(int block_size)
     
     return blocks;
 }
+
+template <class T>
+Image<float> Image<T>::normalized() const
+{
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    // Encontrar mínimo y máximo global
+    T local_min = std::numeric_limits<T>::max();
+    T local_max = std::numeric_limits<T>::lowest();
+    
+    int rows_per_proc = height / size;
+    int remainder = height % size;
+    
+    int start_row = rank * rows_per_proc + std::min(rank, remainder);
+    int ajuste = (rank < remainder) ? 1 : 0;
+    int local_rows = rows_per_proc + ajuste;
+    
+    // Encontrar mínimo y máximo local
+    for (int j = 0; j < local_rows; j++)
+    {
+        for (int i = 0; i < width; i++)
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                int global_row = start_row + j;
+                T value = this->get(global_row, i, c);
+                if (value < local_min) local_min = value;
+                if (value > local_max) local_max = value;
+            }
+        }
+    }
+    
+    // Reducir para encontrar mínimo y máximo global
+    T global_min, global_max;
+    MPI_Allreduce(&local_min, &global_min, 1, 
+                  (std::is_same<T, float>::value) ? MPI_FLOAT : 
+                  (std::is_same<T, double>::value) ? MPI_DOUBLE :
+                  (std::is_same<T, int>::value) ? MPI_INT :
+                  (std::is_same<T, unsigned char>::value) ? MPI_UNSIGNED_CHAR : MPI_BYTE,
+                  MPI_MIN, MPI_COMM_WORLD);
+    
+    MPI_Allreduce(&local_max, &global_max, 1, 
+                  (std::is_same<T, float>::value) ? MPI_FLOAT : 
+                  (std::is_same<T, double>::value) ? MPI_DOUBLE :
+                  (std::is_same<T, int>::value) ? MPI_INT :
+                  (std::is_same<T, unsigned char>::value) ? MPI_UNSIGNED_CHAR : MPI_BYTE,
+                  MPI_MAX, MPI_COMM_WORLD);
+    
+    // Evitar división por cero
+    float range = (float)(global_max - global_min);
+    if (range == 0.0f) range = 1.0f;
+    
+    // Normalizar datos locales
+    int local_size = local_rows * width * channels;
+    float *local_data = new float[local_size];
+    
+    int idx = 0;
+    for (int j = 0; j < local_rows; j++)
+    {
+        for (int i = 0; i < width; i++)
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                int global_row = start_row + j;
+                T value = this->get(global_row, i, c);
+                local_data[idx++] = (float)(value - global_min) / range;
+            }
+        }
+    }
+    
+    // Preparar imagen resultado
+    Image<float> new_image;
+    float *result_data = nullptr;
+    
+    if (rank == 0)
+    {
+        new_image = Image<float>(width, height, channels);
+        result_data = new_image.get_matrix();
+    }
+    
+    // Recolectar datos
+    std::vector<int> recvcounts(size);
+    std::vector<int> displs(size);
+    
+    int elements_per_row = width * channels;
+    for (int i = 0; i < size; i++)
+    {
+        int val = (i < remainder) ? 1 : 0;
+        int proc_rows = rows_per_proc + val;
+        recvcounts[i] = proc_rows * elements_per_row;
+        displs[i] = (i * rows_per_proc + std::min(i, remainder)) * elements_per_row;
+    }
+    
+    MPI_Gatherv(local_data, local_size, MPI_FLOAT, 
+                result_data, recvcounts.data(), displs.data(), 
+                MPI_FLOAT, 0, MPI_COMM_WORLD);
+    
+    delete[] local_data;
+    
+    return new_image;
+}
+
 #endif

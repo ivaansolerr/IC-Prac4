@@ -1,73 +1,109 @@
-#include "image.h"
 #include "png.h"
+#include "image.h"
 #include "jpeglib.h"
 #include <filesystem>
 
 Image<unsigned char> read_png(const std::string &filename) {
-  FILE *fp = fopen(filename.c_str(), "rb");
-  
-  
-  png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
-  if(!png) abort();
-
-  png_infop info = png_create_info_struct(png);
-  if(!info) abort();
-
-  if(setjmp(png_jmpbuf(png))) abort();
-
-  png_init_io(png, fp);
-
-  png_read_info(png, info);
-
-  int width      = png_get_image_width(png, info);
-  int height     = png_get_image_height(png, info);
-  png_byte color_type = png_get_color_type(png, info);
-  png_byte bit_depth  = png_get_bit_depth(png, info);
-  int channels = 0;
-
-  // Read any color_type into 8bit depth, RGBA format.
-  // See http://www.libpng.org/pub/png/libpng-manual.txt
-
-  if(bit_depth == 16)
-    png_set_strip_16(png);
-
-  if(color_type == PNG_COLOR_TYPE_PALETTE)
-    png_set_palette_to_rgb(png);
-
-  // PNG_COLOR_TYPE_GRAY_ALPHA is always 8 or 16bit depth.
-  if(color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
-    png_set_expand_gray_1_2_4_to_8(png);
-
-  if(png_get_valid(png, info, PNG_INFO_tRNS))
-    png_set_tRNS_to_alpha(png);
-
-  png_read_update_info(png, info);
-  
-  if(color_type == PNG_COLOR_TYPE_RGB) channels = 3;
-  else if(color_type == PNG_COLOR_TYPE_RGBA) channels = 4;
-  else if(color_type == PNG_COLOR_TYPE_GRAY) channels = 1;
-  else {
-    std::cerr<<"Unsupported color type "<<color_type<<std::endl;
-    exit(1);
-  }
-
-  Image<unsigned char> image(width, height, channels);
+    FILE *fp = fopen(filename.c_str(), "rb");
+    if (!fp) {
+        std::cerr << "Error: Cannot open file " << filename << std::endl;
+        return Image<unsigned char>();
+    }
     
-  unsigned char **rows = new unsigned char*[image.height];
-  for(int i=0;i<image.height;i++)
-    rows[i] = new unsigned char[image.width*image.channels];
-  png_read_image(png, rows);
-  for(int j=0;j<image.height;j++)
-    for(int i=0; i<image.width;i++)
-        for(int c=0;c<image.channels;c++)
-            image.set(j,i,c, rows[j][i*image.channels + c]);
-            
-  for(int i=0;i<image.height;i++)
-    delete [] rows[i];
-  delete [] rows;
-
-  fclose(fp);
-  return image;
+    // Verificar firma PNG
+    unsigned char header[8];
+    size_t bytes_read = fread(header, 1, 8, fp);
+    if (bytes_read != 8 || png_sig_cmp(header, 0, 8) != 0) {
+        std::cerr << "Error: " << filename << " is not a valid PNG file" << std::endl;
+        fclose(fp);
+        return Image<unsigned char>();
+    }
+    
+    // Crear estructuras PNG
+    png_structp png_ptr = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+    if (!png_ptr) {
+        std::cerr << "Error: png_create_read_struct failed" << std::endl;
+        fclose(fp);
+        return Image<unsigned char>();
+    }
+    
+    png_infop info_ptr = png_create_info_struct(png_ptr);
+    if (!info_ptr) {
+        std::cerr << "Error: png_create_info_struct failed" << std::endl;
+        png_destroy_read_struct(&png_ptr, NULL, NULL);
+        fclose(fp);
+        return Image<unsigned char>();
+    }
+    
+    // Configurar manejo de errores
+    if (setjmp(png_jmpbuf(png_ptr))) {
+        std::cerr << "Error: PNG lib error" << std::endl;
+        png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+        fclose(fp);
+        return Image<unsigned char>();
+    }
+    
+    png_init_io(png_ptr, fp);
+    png_set_sig_bytes(png_ptr, 8);
+    
+    png_read_info(png_ptr, info_ptr);
+    
+    int width = png_get_image_width(png_ptr, info_ptr);
+    int height = png_get_image_height(png_ptr, info_ptr);
+    png_byte color_type = png_get_color_type(png_ptr, info_ptr);
+    png_byte bit_depth = png_get_bit_depth(png_ptr, info_ptr);
+    
+    // Configurar transformaciones
+    if (bit_depth == 16)
+        png_set_strip_16(png_ptr);
+    
+    if (color_type == PNG_COLOR_TYPE_PALETTE)
+        png_set_palette_to_rgb(png_ptr);
+    
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8)
+        png_set_expand_gray_1_2_4_to_8(png_ptr);
+    
+    if (png_get_valid(png_ptr, info_ptr, PNG_INFO_tRNS))
+        png_set_tRNS_to_alpha(png_ptr);
+    
+    // Convertir a RGB o RGBA
+    if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
+        png_set_gray_to_rgb(png_ptr);
+    
+    png_read_update_info(png_ptr, info_ptr);
+    
+    // Determinar número de canales
+    int channels = png_get_channels(png_ptr, info_ptr);
+    
+    // Crear imagen
+    Image<unsigned char> image(width, height, channels);
+    
+    // Leer filas
+    png_bytep *row_pointers = new png_bytep[height];
+    for (int y = 0; y < height; y++) {
+        row_pointers[y] = new png_byte[png_get_rowbytes(png_ptr, info_ptr)];
+    }
+    
+    png_read_image(png_ptr, row_pointers);
+    
+    // Copiar datos a la imagen
+    for (int y = 0; y < height; y++) {
+        png_bytep row = row_pointers[y];
+        for (int x = 0; x < width; x++) {
+            for (int c = 0; c < channels; c++) {
+                image.set(y, x, c, row[x * channels + c]);
+            }
+        }
+        delete[] row_pointers[y];
+    }
+    delete[] row_pointers;
+    
+    // Limpiar
+    png_read_end(png_ptr, NULL);
+    png_destroy_read_struct(&png_ptr, &info_ptr, NULL);
+    fclose(fp);
+    
+    return image;
 }
 
 void write_png(const std::string &filename, const Image<unsigned char> &image) {
